@@ -40,6 +40,7 @@ let oops = NonMaxU8::new(255);
 assert_eq!(oops, None);
 ```
 
+
 ## Features
 
 * `std` (default): implements [`std::error::Error`] for [`ParseIntError`] and
@@ -398,112 +399,248 @@ nonmax!(unsigned, NonMaxU128, NonZeroU128, u128);
 nonmax!(unsigned, NonMaxUsize, NonZeroUsize, usize);
 
 // https://doc.rust-lang.org/1.47.0/src/core/convert/num.rs.html#383-407
-macro_rules! impl_nonmax_from {
-    ( $small: ty, $large: ty ) => {
-        impl From<$small> for $large {
-            #[inline]
-            fn from(small: $small) -> Self {
-                // SAFETY: smaller input type guarantees the value is non-max
-                unsafe { Self::new_unchecked(small.get().into()) }
+/**
+```compile_fail
+use nonmax::*;
+let x = NonMaxUsize::from(NonMaxI16::ZERO);
+```
+```compile_fail
+use nonmax::*;
+let x = NonMaxUsize::from(0u16);
+```
+*/
+mod convert {
+    use super::*;
+
+    macro_rules! value_get {
+        (primitive, $value: ident) => { $value };
+        (nonmax, $value: ident) => { $value.get() };
+    }
+
+    macro_rules! try_into_nonmax_ok {
+        (maxable, $value: ident) => {Self::new($value).ok_or(TryFromIntError(()))};
+        // SAFETY: the value successfully converted and is not able to be the max
+        (nonmaxable, $value: ident) => {unsafe { Ok(Self::new_unchecked($value)) }};
+    }
+
+    macro_rules! nonmax_primitive_mux {
+        (primitive, ($nonmax: ty, $primitive: ty)) => { $primitive };
+        (nonmax, ($nonmax: ty, $primitive: ty)) => { $nonmax };
+    }
+
+    macro_rules! impl_block_inner {
+        ( infallible, from, nonmax, primitive, $value: ident, ($nonmax_from: ty, $primitive_from: ty), ($nonmax_to: ty, $primitive_to: ty) ) => {
+            $value.get().into()
+        };
+
+        ( infallible, from, $from: ident, nonmax, $value: ident, ($nonmax_from: ty, $primitive_from: ty), ($nonmax_to: ty, $primitive_to: ty) ) => {
+            // SAFETY: smaller input type guarantees the value is non-max
+            unsafe { Self::new_unchecked(value_get!($from, $value).into()) }
+        };
+
+        ( infallible, try_from, nonmax, primitive, $value: ident, ($nonmax_from: ty, $primitive_from: ty), ($nonmax_to: ty, $primitive_to: ty) ) => {
+            Ok($value.get() as $primitive_to)
+        };
+
+        ( infallible, try_from, $from: ident, nonmax, $value: ident, ($nonmax_from: ty, $primitive_from: ty), ($nonmax_to: ty, $primitive_to: ty) ) => {
+            // SAFETY: smaller input type guarantees the value is non-max
+            unsafe { Ok(Self::new_unchecked(value_get!($from, $value) as $primitive_to)) }
+        };
+
+        ( fallible, try_from, nonmax, primitive, $value: ident, ($nonmax_from: ty, $primitive_from: ty), ($nonmax_to: ty, $primitive_to: ty) ) => {
+            <$primitive_to>::try_from($value.get()).or(Err(TryFromIntError(())))
+        };
+
+        ( $fallibility: ident, try_from, $from: ident, nonmax, $value: ident, ($nonmax_from: ty, $primitive_from: ty), ($nonmax_to: ty, $primitive_to: ty) ) => {
+            match <$primitive_to>::try_from(value_get!($from, $value)) {
+                Ok(x) => try_into_nonmax_ok!($fallibility, x),
+                Err(_) => Err(TryFromIntError(())),
             }
+        };
+    }
+
+    macro_rules! impl_block {
+        ( from, $fallibility: ident, $from: ident, $to: ident, $from_parts: tt, $to_parts: tt ) => {
+            impl From<nonmax_primitive_mux!($from, $from_parts)> for nonmax_primitive_mux!($to, $to_parts) {
+                #[inline]
+                fn from(value: nonmax_primitive_mux!($from, $from_parts)) -> Self {
+                    impl_block_inner!($fallibility, from, $from, $to, value, $from_parts, $to_parts)
+                }
+            }
+        };
+
+        ( try_from, $fallibility: ident, $from: ident, $to: ident, $from_parts: tt, $to_parts: tt ) => {
+            impl core::convert::TryFrom<nonmax_primitive_mux!($from, $from_parts)> for nonmax_primitive_mux!($to, $to_parts) {
+                type Error = TryFromIntError;
+
+                #[inline]
+                fn try_from(value: nonmax_primitive_mux!($from, $from_parts)) -> Result<Self, TryFromIntError> {
+                    impl_block_inner!($fallibility, try_from, $from, $to, value, $from_parts, $to_parts)
+                }
+            }
+        };
+    }
+
+    macro_rules! triple_impl_block {
+        ( mostly_try, $from: tt, $to: tt, $np: ident, $nn: ident, $pn: ident) => {
+            impl_block!(from, $np, nonmax, primitive, $from, $to);
+            impl_block!(from, $nn, nonmax, nonmax, $from, $to);
+            impl_block!(try_from, $pn, primitive, nonmax, $from, $to);
+        };
+        ( $try_mode: ident, $from: tt, $to: tt, $np: ident, $nn: ident, $pn: ident) => {
+            impl_block!($try_mode, $np, nonmax, primitive, $from, $to);
+            impl_block!($try_mode, $nn, nonmax, nonmax, $from, $to);
+            impl_block!($try_mode, $pn, primitive, nonmax, $from, $to);
+        };
+    }
+
+    macro_rules! by_fallibility {
+        ( infallible, $try_mode: ident, $from: tt, $to: tt ) => {
+            triple_impl_block!($try_mode, $from, $to, infallible, infallible, infallible);
+        };
+
+        ( semi_infallible, $try_mode: ident, $from: tt, $to: tt ) => {
+           triple_impl_block!($try_mode, $from, $to, infallible, infallible, maxable);
+        };
+
+        ( $maxability: ident, $try_mode: ident, $from: tt, $to: tt ) => {
+           triple_impl_block!($try_mode, $from, $to, fallible, $maxability, $maxability);
+        };
+    }
+
+    macro_rules! force_try_on_mostly_try {
+        ($fallibility: ident, mostly_try, $($tail:tt),*) => {
+            by_fallibility!($fallibility, try_from, $($tail),*);
+        };
+
+        ($($tail:tt),*) => {
+            by_fallibility!($($tail),*);
+        };
+    }
+
+    macro_rules! impl_nonmax_convert {
+        ( small_large, $try_mode: ident, $u_1: tt, $i_1: tt, $u_2: tt, $i_2: tt ) => {
+            by_fallibility!(infallible, $try_mode, $u_1, $u_2);
+            force_try_on_mostly_try!(infallible, $try_mode, $u_1, $i_2);
+            by_fallibility!(nonmaxable, try_from, $i_1, $u_2);
+            by_fallibility!(infallible, $try_mode, $i_1, $i_2);
+
+            by_fallibility!(maxable, try_from, $u_2, $u_1);
+            by_fallibility!(maxable, try_from, $i_2, $u_1);
+            by_fallibility!(maxable, try_from, $u_2, $i_1);
+            by_fallibility!(maxable, try_from, $i_2, $i_1);
+        };
+
+        ( same, $try_mode: ident, $u_1: tt, $i_1: tt, $u_2: tt, $i_2: tt ) => {
+            by_fallibility!(semi_infallible, $try_mode, $u_1, $u_2);
+            by_fallibility!(maxable, try_from, $u_1, $i_2);
+            by_fallibility!(nonmaxable, try_from, $i_1, $u_2);
+            by_fallibility!(semi_infallible, $try_mode, $i_1, $i_2);
+
+            by_fallibility!(semi_infallible, try_from, $u_2, $u_1);
+            by_fallibility!(maxable, try_from, $u_2, $i_1);
+            by_fallibility!(nonmaxable, try_from, $i_2, $u_1);
+            by_fallibility!(semi_infallible, try_from, $i_2, $i_1);
+        };
+
+        ( iu, $try_mode: ident, $u_1: tt, $i_1: tt ) => {
+            by_fallibility!(maxable, $try_mode, $u_1, $i_1);
+            by_fallibility!(nonmaxable, $try_mode, $i_1, $u_1);
+        };
+
+        ( a8, $($tail:tt),* ) => {impl_nonmax_convert!( $($tail),* , (NonMaxU8, u8), (NonMaxI8, i8) );};
+        ( a16, $($tail:tt),* ) => {impl_nonmax_convert!( $($tail),* , (NonMaxU16, u16), (NonMaxI16, i16) );};
+        ( a32, $($tail:tt),* ) => {impl_nonmax_convert!( $($tail),* , (NonMaxU32, u32), (NonMaxI32, i32) );};
+        ( a64, $($tail:tt),* ) => {impl_nonmax_convert!( $($tail),* , (NonMaxU64, u64), (NonMaxI64, i64) );};
+        ( a128, $($tail:tt),* ) => {impl_nonmax_convert!( $($tail),* , (NonMaxU128, u128), (NonMaxI128, i128) );};
+        ( asize, $($tail:tt),* ) => {impl_nonmax_convert!( $($tail),* , (NonMaxUsize, usize), (NonMaxIsize, isize) );};
+        ( ($first: tt, $rest: tt), $($tail:tt),*) => {
+            impl_nonmax_convert!($first, $($tail),*);
+            impl_nonmax_convert!($rest, $($tail),*);
+        };
+    }
+
+    impl_nonmax_convert!(a8, (a16, (a32, (a64, (a128, asize)))), small_large, from);
+    impl_nonmax_convert!(a16, (a32, (a64, a128)), small_large, from);
+    impl_nonmax_convert!(a32, (a64, a128), small_large, from);
+    impl_nonmax_convert!(a64, a128, small_large, from);
+    impl_nonmax_convert!((a8, (a16, (a32, (a64, (a128, asize))))), iu, try_from);
+
+    #[cfg(target_pointer_width = "16")]
+    mod convert_iusize {
+        use super::*;
+        impl_nonmax_convert!(a16, asize, same, mostly_try);
+        impl_nonmax_convert!(asize, (a32, (a64, a128)), small_large, try_from);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    mod convert_iusize {
+        use super::*;
+        impl_nonmax_convert!(a16, asize, small_large, mostly_try);
+        impl_nonmax_convert!(a32, asize, same, try_from);
+        impl_nonmax_convert!(asize, (a64, a128), small_large, try_from);
+    }
+
+
+    #[cfg(target_pointer_width = "64")]
+    mod convert_iusize {
+        use super::*;
+        impl_nonmax_convert!(a16, asize, small_large, mostly_try);
+        impl_nonmax_convert!(a32, asize, small_large, try_from);
+        impl_nonmax_convert!(a64, asize, same, try_from);
+        impl_nonmax_convert!(asize, a128, small_large, try_from);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use core::convert::TryFrom;
+
+
+        #[test]
+        fn basic_conversions() {
+            assert!(NonMaxI32::try_from(0u8).is_ok());
+            assert!(NonMaxU8::try_from(255).is_err());
+            assert!(NonMaxI8::try_from(127).is_err());
+            assert!(NonMaxU8::try_from(255u32).is_err());
+            assert!(usize::try_from(NonMaxI16::MAX).is_ok());
+            assert!(NonMaxI32::try_from(NonMaxU32::try_from(i32::MAX).unwrap()).is_err());
         }
-    };
+
+        #[cfg(target_pointer_width = "16")]
+        #[test]
+        fn usize_friend() {
+            assert!(usize::try_from(u16::MAX).is_ok());
+            assert!(NonMaxUsize::try_from(u16::MAX).is_err());
+            assert!(NonMaxU16::try_from(usize::MAX).is_err());
+        }
+
+        #[cfg(target_pointer_width = "32")]
+        #[test]
+        fn usize_friend() {
+            assert!(usize::try_from(u32::MAX).is_ok());
+            assert!(NonMaxUsize::try_from(u32::MAX).is_err());
+            assert!(NonMaxU32::try_from(usize::MAX).is_err());
+        }
+
+        #[cfg(target_pointer_width = "64")]
+        #[test]
+        fn usize_friend() {
+            assert!(usize::try_from(u64::MAX).is_ok());
+            assert!(NonMaxUsize::try_from(u64::MAX).is_err());
+            assert!(NonMaxU64::try_from(usize::MAX).is_err());
+        }
+
+        #[test]
+        fn should_compile() {
+            let x = usize::from(NonMaxU16::MAX);
+            assert_eq!(x, x);
+            let x = NonMaxUsize::from(NonMaxU16::MAX);
+            assert_eq!(x, x);
+        }
+    }
 }
 
-// Non-max Unsigned -> Non-max Unsigned
-impl_nonmax_from!(NonMaxU8, NonMaxU16);
-impl_nonmax_from!(NonMaxU8, NonMaxU32);
-impl_nonmax_from!(NonMaxU8, NonMaxU64);
-impl_nonmax_from!(NonMaxU8, NonMaxU128);
-impl_nonmax_from!(NonMaxU8, NonMaxUsize);
-impl_nonmax_from!(NonMaxU16, NonMaxU32);
-impl_nonmax_from!(NonMaxU16, NonMaxU64);
-impl_nonmax_from!(NonMaxU16, NonMaxU128);
-impl_nonmax_from!(NonMaxU16, NonMaxUsize);
-impl_nonmax_from!(NonMaxU32, NonMaxU64);
-impl_nonmax_from!(NonMaxU32, NonMaxU128);
-impl_nonmax_from!(NonMaxU64, NonMaxU128);
-
-// Non-max Signed -> Non-max Signed
-impl_nonmax_from!(NonMaxI8, NonMaxI16);
-impl_nonmax_from!(NonMaxI8, NonMaxI32);
-impl_nonmax_from!(NonMaxI8, NonMaxI64);
-impl_nonmax_from!(NonMaxI8, NonMaxI128);
-impl_nonmax_from!(NonMaxI8, NonMaxIsize);
-impl_nonmax_from!(NonMaxI16, NonMaxI32);
-impl_nonmax_from!(NonMaxI16, NonMaxI64);
-impl_nonmax_from!(NonMaxI16, NonMaxI128);
-impl_nonmax_from!(NonMaxI16, NonMaxIsize);
-impl_nonmax_from!(NonMaxI32, NonMaxI64);
-impl_nonmax_from!(NonMaxI32, NonMaxI128);
-impl_nonmax_from!(NonMaxI64, NonMaxI128);
-
-// Non-max Unsigned -> Non-max Signed
-impl_nonmax_from!(NonMaxU8, NonMaxI16);
-impl_nonmax_from!(NonMaxU8, NonMaxI32);
-impl_nonmax_from!(NonMaxU8, NonMaxI64);
-impl_nonmax_from!(NonMaxU8, NonMaxI128);
-impl_nonmax_from!(NonMaxU8, NonMaxIsize);
-impl_nonmax_from!(NonMaxU16, NonMaxI32);
-impl_nonmax_from!(NonMaxU16, NonMaxI64);
-impl_nonmax_from!(NonMaxU16, NonMaxI128);
-impl_nonmax_from!(NonMaxU32, NonMaxI64);
-impl_nonmax_from!(NonMaxU32, NonMaxI128);
-impl_nonmax_from!(NonMaxU64, NonMaxI128);
-
-// https://doc.rust-lang.org/1.47.0/src/core/convert/num.rs.html#383-407
-macro_rules! impl_smaller_from {
-    ( $small: ty, $large: ty ) => {
-        impl From<$small> for $large {
-            #[inline]
-            fn from(small: $small) -> Self {
-                // SAFETY: smaller input type guarantees the value is non-max
-                unsafe { Self::new_unchecked(small.into()) }
-            }
-        }
-    };
-}
-
-// Unsigned -> Non-max Unsigned
-impl_smaller_from!(u8, NonMaxU16);
-impl_smaller_from!(u8, NonMaxU32);
-impl_smaller_from!(u8, NonMaxU64);
-impl_smaller_from!(u8, NonMaxU128);
-impl_smaller_from!(u8, NonMaxUsize);
-impl_smaller_from!(u16, NonMaxU32);
-impl_smaller_from!(u16, NonMaxU64);
-impl_smaller_from!(u16, NonMaxU128);
-impl_smaller_from!(u16, NonMaxUsize);
-impl_smaller_from!(u32, NonMaxU64);
-impl_smaller_from!(u32, NonMaxU128);
-impl_smaller_from!(u64, NonMaxU128);
-
-// Signed -> Non-max Signed
-impl_smaller_from!(i8, NonMaxI16);
-impl_smaller_from!(i8, NonMaxI32);
-impl_smaller_from!(i8, NonMaxI64);
-impl_smaller_from!(i8, NonMaxI128);
-impl_smaller_from!(i8, NonMaxIsize);
-impl_smaller_from!(i16, NonMaxI32);
-impl_smaller_from!(i16, NonMaxI64);
-impl_smaller_from!(i16, NonMaxI128);
-impl_smaller_from!(i16, NonMaxIsize);
-impl_smaller_from!(i32, NonMaxI64);
-impl_smaller_from!(i32, NonMaxI128);
-impl_smaller_from!(i64, NonMaxI128);
-
-// Unsigned -> Non-max Signed
-impl_smaller_from!(u8, NonMaxI16);
-impl_smaller_from!(u8, NonMaxI32);
-impl_smaller_from!(u8, NonMaxI64);
-impl_smaller_from!(u8, NonMaxI128);
-impl_smaller_from!(u8, NonMaxIsize);
-impl_smaller_from!(u16, NonMaxI32);
-impl_smaller_from!(u16, NonMaxI64);
-impl_smaller_from!(u16, NonMaxI128);
-impl_smaller_from!(u32, NonMaxI64);
-impl_smaller_from!(u32, NonMaxI128);
-impl_smaller_from!(u64, NonMaxI128);
 
 #[cfg(test)]
 mod ops {
